@@ -4,6 +4,10 @@
   "description": "Cross-cell TypeScript diagnostics for Jupyter notebooks.",
   "version": "0.0.1",
   "publisher": "affon",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/affon-ai/vscode-notebook-ts"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
