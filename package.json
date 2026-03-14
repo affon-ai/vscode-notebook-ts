@@ -57,11 +57,14 @@
   },
   "scripts": {
     "build": "tsc -p .",
-    "watch": "tsc -p . -w"
+    "watch": "tsc -p . -w",
+    "package": "vsce package",
+    "publish": "vsce publish"
   },
   "devDependencies": {
     "@types/vscode": "^1.90.0",
-    "typescript": "^5.4.0"
+    "typescript": "^5.4.0",
+    "vsce": "^3.2.2"
   },
   "dependencies": {
     "@types/node": "^25.5.0"
