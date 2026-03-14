@@ -1,0 +1,69 @@
+{
+  "name": "vscode-notebook-ts",
+  "displayName": "TypeScript Notebook Support",
+  "description": "Cross-cell TypeScript diagnostics for Jupyter notebooks.",
+  "version": "0.0.1",
+  "publisher": "notebook-ts",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onNotebook:jupyter-notebook",
+    "onLanguage:typescript",
+    "onCommand:notebookTs.dumpVirtualDoc"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "typescript",
+        "extensions": [
+          ".ts"
+        ],
+        "aliases": [
+          "TypeScript",
+          "ts"
+        ]
+      }
+    ],
+    "commands": [
+      {
+        "command": "notebookTs.dumpVirtualDoc",
+        "title": "Notebook TS: Dump Virtual Document"
+      }
+    ],
+    "configuration": {
+      "title": "TypeScript Notebook Support",
+      "properties": {
+        "notebookTs.tsconfigPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a tsconfig.json to source typeRoots for notebook type checking. Relative paths are resolved against the workspace folder."
+        },
+        "notebookTs.typeRoots": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "description": "Directories containing .d.ts files to include in notebook type checking. Used if tsconfigPath is not set. Relative paths are resolved against the workspace folder."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "watch": "tsc -p . -w"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@types/node": "^25.5.0"
+  }
+}

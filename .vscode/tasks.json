@@ -1,0 +1,22 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "npm: build",
+      "type": "shell",
+      "command": "npm",
+      "args": ["run", "build"],
+      "problemMatcher": "$tsc",
+      "options": {
+        "shell": {
+          "executable": "/bin/zsh",
+          "args": ["-l", "-c"]
+        },
+        "env": {
+          "NVM_DIR": "${env:HOME}/.nvm",
+          "PATH": "${env:HOME}/.nvm/current/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        }
+      }
+    }
+  ]
+}
