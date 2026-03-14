@@ -1,6 +1,6 @@
 {
   "name": "vscode-notebook-ts",
-  "displayName": "TypeScript Notebook Support",
+  "displayName": "TypeScript/JavaScript Notebook Support",
   "description": "Cross-cell TypeScript diagnostics for Jupyter notebooks.",
   "version": "0.0.1",
   "publisher": "affon",
