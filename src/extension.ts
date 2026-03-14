@@ -2,7 +2,7 @@ import * as vscode from 'vscode'
 import * as path from 'path'
 
 const SCHEME = 'notebook-ts'
-const DIAG_COLLECTION = 'ts-notebook'
+const DIAG_COLLECTION = 'notebook-ts'
 const CONFIG_SECTION = 'notebookTs'
 const CONFIG_TYPE_ROOTS = 'typeRoots'
 const CONFIG_TSCONFIG = 'tsconfigPath'
