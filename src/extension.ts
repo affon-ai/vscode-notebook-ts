@@ -6,6 +6,9 @@ const DIAG_COLLECTION = 'notebook-ts'
 const CONFIG_SECTION = 'notebookTs'
 const CONFIG_TYPE_ROOTS = 'typeRoots'
 const CONFIG_TSCONFIG = 'tsconfigPath'
+const VIRTUAL_DIR = 'notebook-ts'
+const UPDATE_DEBOUNCE_MS = 200
+const BACKGROUND_FLUSH_MS = 500
 
 interface CellRange {
   cell: vscode.NotebookCell
@@ -15,7 +18,7 @@ interface CellRange {
 
 interface NotebookState {
   virtualUri: vscode.Uri
-  content: string
+  lines: string[]
   ranges: CellRange[]
   headerLines: string[]
 }
@@ -62,20 +65,24 @@ export function activate(context: vscode.ExtensionContext) {
   status.show()
   context.subscriptions.push(status)
 
-  const hoverDecoration = vscode.window.createTextEditorDecorationType({
-    textDecoration: 'underline'
-  })
-  context.subscriptions.push(hoverDecoration)
-  const underlineTimers = new Map<string, NodeJS.Timeout>()
-
   const stateByNotebook = new Map<string, NotebookState>()
+  const pendingByNotebook = new Map<string, NotebookState>()
+  const updateTimers = new Map<string, NodeJS.Timeout>()
+  const dirtyCells = new Set<string>()
+  const dirtyNotebooks = new Set<string>()
+  const backgroundTimers = new Map<string, NodeJS.Timeout>()
 
   function notebookKey(nb: vscode.NotebookDocument): string {
     return nb.uri.toString()
   }
 
   function virtualUriFor(nb: vscode.NotebookDocument): vscode.Uri {
-    const id = Buffer.from(nb.uri.toString()).toString('base64')
+    const id = Buffer.from(nb.uri.toString()).toString('base64').replace(/[/+=]/g, '_')
+    const ws = vscode.workspace.getWorkspaceFolder(nb.uri)
+    if (ws) {
+      const filePath = path.join(ws.uri.fsPath, VIRTUAL_DIR, `${id}.ts`)
+      return vscode.Uri.file(filePath)
+    }
     return vscode.Uri.from({ scheme: SCHEME, path: `/${id}.ts` })
   }
 
@@ -85,6 +92,10 @@ export function activate(context: vscode.ExtensionContext) {
     const cfg = vscode.workspace.getConfiguration(CONFIG_SECTION, nb.uri)
     const roots = cfg.get<string[]>(CONFIG_TYPE_ROOTS, [])
     return roots.map(root => path.isAbsolute(root) ? root : path.join(ws.uri.fsPath, root))
+  }
+
+  function isTsLikeLanguage(id: string): boolean {
+    return id === 'typescript' || id === 'javascript'
   }
 
   async function resolveTypeRootsFromTsconfig(nb: vscode.NotebookDocument): Promise<{ roots: string[]; usedPath: string | null }> {
@@ -145,7 +156,7 @@ export function activate(context: vscode.ExtensionContext) {
     return { lines, usedTsconfig: resolved.usedPath, roots }
   }
 
-  function buildVirtualContent(nb: vscode.NotebookDocument, headerLines: string[]): { content: string; ranges: CellRange[] } {
+  function buildVirtualContent(nb: vscode.NotebookDocument, headerLines: string[]): { lines: string[]; ranges: CellRange[] } {
     let line = 0
     const ranges: CellRange[] = []
     const parts: string[] = []
@@ -159,7 +170,7 @@ export function activate(context: vscode.ExtensionContext) {
 
     nb.getCells().forEach((cell, idx) => {
       if (cell.kind !== vscode.NotebookCellKind.Code) return
-      if (cell.document.languageId !== 'typescript' && cell.document.languageId !== 'javascript') return
+      if (!isTsLikeLanguage(cell.document.languageId)) return
 
       parts.push(`// Cell ${idx + 1}`)
       line += 1
@@ -178,30 +189,184 @@ export function activate(context: vscode.ExtensionContext) {
       line += 1
     })
 
-    return { content: parts.join('\n'), ranges }
+    return { lines: parts, ranges }
   }
 
   async function ensureVirtualDocument(nb: vscode.NotebookDocument) {
     const vuri = virtualUriFor(nb)
     const resolved = await resolveTypeReferences(nb)
-    const { content, ranges } = buildVirtualContent(nb, resolved.lines)
-    provider.update(vuri, content)
+    const { lines, ranges } = buildVirtualContent(nb, resolved.lines)
+    if (vuri.scheme === 'file') {
+      const dir = vscode.Uri.file(path.dirname(vuri.fsPath))
+      try {
+        await vscode.workspace.fs.createDirectory(dir)
+      } catch {
+        // ignore
+      }
+      await vscode.workspace.fs.writeFile(vuri, Buffer.from(lines.join('\n')))
+    } else {
+      provider.update(vuri, lines.join('\n'))
+    }
 
     const key = notebookKey(nb)
-    stateByNotebook.set(key, { virtualUri: vuri, content, ranges, headerLines: resolved.lines })
+    stateByNotebook.set(key, { virtualUri: vuri, lines, ranges, headerLines: resolved.lines })
 
     const doc = await vscode.workspace.openTextDocument(vuri)
     await vscode.languages.setTextDocumentLanguage(doc, 'typescript')
   }
 
-  function updateFromNotebook(nb: vscode.NotebookDocument) {
+  async function updateVirtualFile(uri: vscode.Uri, content: string): Promise<void> {
+    const doc = await vscode.workspace.openTextDocument(uri)
+    const lastLine = Math.max(0, doc.lineCount - 1)
+    const endChar = doc.lineCount > 0 ? doc.lineAt(lastLine).text.length : 0
+    const fullRange = new vscode.Range(new vscode.Position(0, 0), new vscode.Position(lastLine, endChar))
+    const edit = new vscode.WorkspaceEdit()
+    edit.replace(uri, fullRange, content)
+    await vscode.workspace.applyEdit(edit)
+  }
+
+  async function applyCellUpdate(cellDoc: vscode.TextDocument): Promise<boolean> {
+    const match = findNotebookStateForCell(cellDoc)
+    if (!match) return false
+    const state = match.state
+    const range = state.ranges.find(r => r.cell.document.uri.toString() === cellDoc.uri.toString())
+    if (!range) return false
+    if (state.virtualUri.scheme !== 'file') return false
+
+    const lines = state.lines.slice()
+    const oldStart = range.startLine
+    const oldEnd = range.endLine
+    if (oldStart < 0 || oldEnd >= lines.length) return false
+
+    const oldLineCount = oldEnd - oldStart + 1
+    const newText = cellDoc.getText()
+    const newLines = newText.split(/\r?\n/)
+
+    const oldEndChar = lines[oldEnd]?.length ?? 0
+    const replaceRange = new vscode.Range(
+      new vscode.Position(oldStart, 0),
+      new vscode.Position(oldEnd, oldEndChar)
+    )
+
+    const edit = new vscode.WorkspaceEdit()
+    edit.replace(state.virtualUri, replaceRange, newText)
+    await vscode.workspace.applyEdit(edit)
+
+    lines.splice(oldStart, oldLineCount, ...newLines)
+
+    const delta = newLines.length - oldLineCount
+    const updatedRanges = state.ranges.map(r => {
+      if (r.cell.document.uri.toString() === cellDoc.uri.toString()) {
+        return {
+          cell: r.cell,
+          startLine: r.startLine,
+          endLine: r.startLine + newLines.length - 1
+        }
+      }
+      if (r.startLine > oldEnd) {
+        return {
+          cell: r.cell,
+          startLine: r.startLine + delta,
+          endLine: r.endLine + delta
+        }
+      }
+      return r
+    })
+
+    const key = notebookKey(match.cell.notebook)
+    stateByNotebook.set(key, {
+      virtualUri: state.virtualUri,
+      lines,
+      ranges: updatedRanges,
+      headerLines: state.headerLines
+    })
+    dirtyCells.delete(cellDoc.uri.toString())
+    return true
+  }
+
+  async function flushCellUpdate(cellDoc: vscode.TextDocument): Promise<void> {
+    await applyCellUpdate(cellDoc)
+  }
+
+  function scheduleBackgroundFlush(nb: vscode.NotebookDocument) {
+    const key = notebookKey(nb)
+    const existing = backgroundTimers.get(key)
+    if (existing) clearTimeout(existing)
+    const timer = setTimeout(() => {
+      flushBackground(nb).catch(() => {})
+    }, BACKGROUND_FLUSH_MS)
+    backgroundTimers.set(key, timer)
+  }
+
+  async function flushBackground(nb: vscode.NotebookDocument): Promise<void> {
+    const key = notebookKey(nb)
+    const timer = backgroundTimers.get(key)
+    if (timer) clearTimeout(timer)
+    backgroundTimers.delete(key)
+
+    if (dirtyNotebooks.has(key)) {
+      await flushPending(nb)
+    }
+
+    for (const cell of nb.getCells()) {
+      const uri = cell.document.uri.toString()
+      if (!dirtyCells.has(uri)) continue
+      await flushCellUpdate(cell.document)
+    }
+  }
+
+
+  function computeNotebookState(nb: vscode.NotebookDocument): NotebookState {
     const key = notebookKey(nb)
     const existing = stateByNotebook.get(key)
     const vuri = existing?.virtualUri ?? virtualUriFor(nb)
     const headerLines = existing?.headerLines ?? []
-    const { content, ranges } = buildVirtualContent(nb, headerLines)
-    provider.update(vuri, content)
-    stateByNotebook.set(key, { virtualUri: vuri, content, ranges, headerLines })
+    const { lines, ranges } = buildVirtualContent(nb, headerLines)
+    return { virtualUri: vuri, lines, ranges, headerLines }
+  }
+
+  async function updateFromNotebook(nb: vscode.NotebookDocument) {
+    const key = notebookKey(nb)
+    const next = computeNotebookState(nb)
+    if (next.virtualUri.scheme === 'file') {
+      await updateVirtualFile(next.virtualUri, next.lines.join('\n'))
+    } else {
+      provider.update(next.virtualUri, next.lines.join('\n'))
+    }
+    stateByNotebook.set(key, next)
+    pendingByNotebook.delete(key)
+    dirtyNotebooks.delete(key)
+    const timer = updateTimers.get(key)
+    if (timer) clearTimeout(timer)
+    updateTimers.delete(key)
+  }
+
+  function scheduleUpdate(nb: vscode.NotebookDocument) {
+    const key = notebookKey(nb)
+    const next = computeNotebookState(nb)
+    pendingByNotebook.set(key, next)
+    const existing = updateTimers.get(key)
+    if (existing) clearTimeout(existing)
+    const timer = setTimeout(() => {
+      flushPending(nb).catch(() => {})
+    }, UPDATE_DEBOUNCE_MS)
+    updateTimers.set(key, timer)
+  }
+
+  async function flushPending(nb: vscode.NotebookDocument) {
+    const key = notebookKey(nb)
+    const pending = pendingByNotebook.get(key)
+    if (!pending) return
+    if (pending.virtualUri.scheme === 'file') {
+      await updateVirtualFile(pending.virtualUri, pending.lines.join('\n'))
+    } else {
+      provider.update(pending.virtualUri, pending.lines.join('\n'))
+    }
+    stateByNotebook.set(key, pending)
+    pendingByNotebook.delete(key)
+    const timer = updateTimers.get(key)
+    if (timer) clearTimeout(timer)
+    updateTimers.delete(key)
   }
 
   function mapDiagnostics(nbState: NotebookState, diags: readonly vscode.Diagnostic[]): Map<string, vscode.Diagnostic[]> {
@@ -209,6 +374,7 @@ export function activate(context: vscode.ExtensionContext) {
     const ranges = nbState.ranges
 
     for (const d of diags) {
+      if (d.code === 6133) continue
       const line = d.range.start.line
       const range = ranges.find(r => line >= r.startLine && line <= r.endLine)
       if (!range) continue
@@ -266,12 +432,12 @@ export function activate(context: vscode.ExtensionContext) {
 
   function mapLocationToCell(state: NotebookState, loc: vscode.Location | vscode.LocationLink): vscode.Location | vscode.LocationLink {
     if ('uri' in loc) {
-      if (loc.uri.scheme !== SCHEME) return loc
+      if (loc.uri.toString() !== state.virtualUri.toString()) return loc
       const mapped = mapVirtualRangeToCellRange(state, loc.range)
       if (!mapped) return loc
       return new vscode.Location(mapped.uri, mapped.range)
     }
-    if (loc.targetUri.scheme !== SCHEME) return loc
+    if (loc.targetUri.toString() !== state.virtualUri.toString()) return loc
     const targetRange = mapVirtualRangeToCellRange(state, loc.targetRange)
     const targetSelection = mapVirtualRangeToCellRange(state, loc.targetSelectionRange ?? loc.targetRange)
     if (!targetRange || !targetSelection) return loc
@@ -290,19 +456,48 @@ export function activate(context: vscode.ExtensionContext) {
     return defs.length > 0 && 'targetUri' in defs[0]
   }
 
-  function underlineRange(doc: vscode.TextDocument, range: vscode.Range | undefined) {
-    if (!range) return
-    const editor = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === doc.uri.toString())
-    if (!editor) return
-    const key = editor.document.uri.toString()
-    const existing = underlineTimers.get(key)
-    if (existing) clearTimeout(existing)
-    editor.setDecorations(hoverDecoration, [range])
-    const timer = setTimeout(() => {
-      editor.setDecorations(hoverDecoration, [])
-      underlineTimers.delete(key)
-    }, 400)
-    underlineTimers.set(key, timer)
+  function mapRangeToCellRange(state: NotebookState, range: vscode.Range): vscode.Range | null {
+    const mapped = mapVirtualRangeToCellRange(state, range)
+    return mapped ? mapped.range : null
+  }
+
+  function mapTextEditToCell(state: NotebookState, edit: vscode.TextEdit): vscode.TextEdit | null {
+    const mapped = mapRangeToCellRange(state, edit.range)
+    if (!mapped) return null
+    return new vscode.TextEdit(mapped, edit.newText)
+  }
+
+  function mapCompletionRangeToCell(
+    state: NotebookState,
+    range: vscode.Range | { inserting: vscode.Range; replacing: vscode.Range }
+  ): vscode.Range | { inserting: vscode.Range; replacing: vscode.Range } | null {
+    if (range instanceof vscode.Range) {
+      return mapRangeToCellRange(state, range)
+    }
+    const inserting = mapRangeToCellRange(state, range.inserting)
+    const replacing = mapRangeToCellRange(state, range.replacing)
+    if (!inserting || !replacing) return null
+    return { inserting, replacing }
+  }
+
+  function mapCompletionItemToCell(state: NotebookState, item: vscode.CompletionItem): vscode.CompletionItem | null {
+    if (item.range) {
+      const mappedRange = mapCompletionRangeToCell(state, item.range)
+      if (!mappedRange) return null
+      item.range = mappedRange
+    }
+    if (item.textEdit) {
+      const mappedEdit = mapTextEditToCell(state, item.textEdit)
+      if (!mappedEdit) return null
+      item.textEdit = mappedEdit
+    }
+    if (item.additionalTextEdits && item.additionalTextEdits.length > 0) {
+      const mapped = item.additionalTextEdits
+        .map(edit => mapTextEditToCell(state, edit))
+        .filter((edit): edit is vscode.TextEdit => edit !== null)
+      item.additionalTextEdits = mapped
+    }
+    return item
   }
 
   context.subscriptions.push(
@@ -310,15 +505,52 @@ export function activate(context: vscode.ExtensionContext) {
       ensureVirtualDocument(nb).catch(() => {})
     }),
     vscode.workspace.onDidChangeNotebookDocument(e => {
-      updateFromNotebook(e.notebook)
+      dirtyNotebooks.add(notebookKey(e.notebook))
+      scheduleUpdate(e.notebook)
+      scheduleBackgroundFlush(e.notebook)
+    }),
+    vscode.workspace.onDidChangeTextDocument(e => {
+      if (e.document.uri.scheme !== 'vscode-notebook-cell') return
+      dirtyCells.add(e.document.uri.toString())
+      const match = findNotebookStateForCell(e.document)
+      if (match) {
+        scheduleBackgroundFlush(match.cell.notebook)
+      }
+      const isTs = isTsLikeLanguage(e.document.languageId)
+      if (isTs && e.contentChanges.length === 1) {
+        const change = e.contentChanges[0]
+        if (change.text.length === 1 && (change.text === '(' || change.text === ',')) {
+          const match = findNotebookStateForCell(e.document)
+          if (match) {
+            flushCellUpdate(e.document).catch(() => {})
+          }
+        }
+        if (change.text.length === 1 && change.text === '.') {
+          const editor = vscode.window.activeTextEditor
+          if (editor && editor.document.uri.toString() === e.document.uri.toString()) {
+            setTimeout(() => {
+              vscode.commands.executeCommand('editor.action.triggerSuggest').then(undefined, () => {})
+            }, 0)
+          }
+        }
+        if (change.text.length === 1 && (change.text === '(' || change.text === ',')) {
+          const editor = vscode.window.activeTextEditor
+          if (editor && editor.document.uri.toString() === e.document.uri.toString()) {
+            setTimeout(() => {
+              vscode.commands.executeCommand('editor.action.triggerParameterHints').then(undefined, () => {})
+            }, 0)
+          }
+        }
+      }
     }),
     vscode.languages.onDidChangeDiagnostics(e => {
       for (const uri of e.uris) {
-        if (uri.scheme !== SCHEME) continue
         const nbEntry = [...stateByNotebook.values()].find(s => s.virtualUri.toString() === uri.toString())
         if (!nbEntry) continue
         const mapped = mapDiagnostics(nbEntry, vscode.languages.getDiagnostics(uri))
-        for (const [cellUri, cellDiags] of mapped.entries()) {
+        const allCellUris = nbEntry.ranges.map(r => r.cell.document.uri.toString())
+        for (const cellUri of allCellUris) {
+          const cellDiags = mapped.get(cellUri) ?? []
           diagnostics.set(vscode.Uri.parse(cellUri), cellDiags)
         }
       }
@@ -329,16 +561,6 @@ export function activate(context: vscode.ExtensionContext) {
       vscode.workspace.notebookDocuments.forEach(nb => {
         ensureVirtualDocument(nb).catch(() => {})
       })
-    }),
-    vscode.window.onDidChangeTextEditorSelection(e => {
-      if (e.textEditor) {
-        e.textEditor.setDecorations(hoverDecoration, [])
-      }
-    }),
-    vscode.window.onDidChangeActiveTextEditor(e => {
-      if (e) {
-        e.setDecorations(hoverDecoration, [])
-      }
     }),
     vscode.commands.registerCommand('notebookTs.dumpVirtualDoc', async () => {
       const editor = vscode.window.activeNotebookEditor
@@ -368,7 +590,7 @@ export function activate(context: vscode.ExtensionContext) {
       output.appendLine(`Resolved typeRoots: ${resolved.roots.length ? resolved.roots.join(', ') : '(empty)'}`)
       output.appendLine(`Used tsconfig: ${resolved.usedTsconfig || '(none)'}`)
       output.appendLine('---')
-      output.appendLine(state.content)
+      output.appendLine(state.lines.join('\n'))
       output.show(true)
     })
   )
@@ -381,20 +603,41 @@ export function activate(context: vscode.ExtensionContext) {
         { language: 'javascript', scheme: 'vscode-notebook-cell' }
       ],
       {
-        async provideCompletionItems(doc, pos) {
+        async provideCompletionItems(doc, pos, _token, context) {
+          if (context.triggerKind === vscode.CompletionTriggerKind.TriggerCharacter) {
+            const ch = context.triggerCharacter ?? ''
+            if (ch !== '.') {
+              return undefined
+            }
+          }
           const match = findNotebookStateForCell(doc)
           if (!match) return undefined
-          const vpos = mapCellPositionToVirtual(match.state, match.cell, pos)
+          if (dirtyCells.has(doc.uri.toString())) {
+            await flushCellUpdate(doc)
+          }
+          if (dirtyNotebooks.has(notebookKey(match.cell.notebook))) {
+            await flushPending(match.cell.notebook)
+          }
+          const fresh = findNotebookStateForCell(doc) ?? match
+          const vpos = mapCellPositionToVirtual(fresh.state, fresh.cell, pos)
           if (!vpos) return undefined
           const list = await vscode.commands.executeCommand<vscode.CompletionList>(
             'vscode.executeCompletionItemProvider',
-            match.state.virtualUri,
-            vpos
+            fresh.state.virtualUri,
+            vpos,
+            context.triggerCharacter,
+            context.triggerKind
           )
-          return list
+          if (!list) return list
+
+          const items = list.items
+            .map(item => mapCompletionItemToCell(fresh.state, item))
+            .filter((item): item is vscode.CompletionItem => item !== null)
+
+          return new vscode.CompletionList(items, list.isIncomplete)
         }
       },
-      '.', ':', '_'
+      '.'
     )
   )
 
@@ -420,10 +663,7 @@ export function activate(context: vscode.ExtensionContext) {
           const h = hover[0]
           if (h.range) {
             const mapped = mapVirtualRangeToCellRange(match.state, h.range)
-            if (mapped) {
-              underlineRange(doc, mapped.range)
-              return new vscode.Hover(h.contents, mapped.range)
-            }
+            if (mapped) return new vscode.Hover(h.contents, mapped.range)
           }
           return h
         }
@@ -490,41 +730,37 @@ export function activate(context: vscode.ExtensionContext) {
     )
   )
 
-  // Document link provider (caret-only link to avoid global underlines)
+  // Signature help provider (basic mapping)
   context.subscriptions.push(
-    vscode.languages.registerDocumentLinkProvider(
+    vscode.languages.registerSignatureHelpProvider(
       [
         { language: 'typescript', scheme: 'vscode-notebook-cell' },
         { language: 'javascript', scheme: 'vscode-notebook-cell' }
       ],
       {
-        async provideDocumentLinks(doc) {
+        async provideSignatureHelp(doc, pos, _token, context) {
           const match = findNotebookStateForCell(doc)
           if (!match) return undefined
-
-          const editor = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === doc.uri.toString())
-          if (!editor) return []
-          const pos = editor.selection.active
-          if (!editor.selection.isEmpty) return []
-
-          const wordRange = doc.getWordRangeAtPosition(pos, /[A-Za-z_$][\w$]*/)
-          if (!wordRange) return []
-
-          const vpos = mapCellPositionToVirtual(match.state, match.cell, pos)
-          if (!vpos) return []
-
-          const defs = await vscode.commands.executeCommand<vscode.Location[] | vscode.LocationLink[]>(
-            'vscode.executeDefinitionProvider',
-            match.state.virtualUri,
-            vpos
+          if (dirtyCells.has(doc.uri.toString())) {
+            await flushCellUpdate(doc)
+          }
+          if (dirtyNotebooks.has(notebookKey(match.cell.notebook))) {
+            await flushPending(match.cell.notebook)
+          }
+          const fresh = findNotebookStateForCell(doc) ?? match
+          const vpos = mapCellPositionToVirtual(fresh.state, fresh.cell, pos)
+          if (!vpos) return undefined
+          const help = await vscode.commands.executeCommand<vscode.SignatureHelp>(
+            'vscode.executeSignatureHelpProvider',
+            fresh.state.virtualUri,
+            vpos,
+            context.triggerCharacter,
+            context.isRetrigger
           )
-          if (!defs || defs.length === 0) return []
-
-          const mapped = mapLocationToCell(match.state, defs[0])
-          const targetUri = 'uri' in mapped ? mapped.uri : mapped.targetUri
-          return [new vscode.DocumentLink(wordRange, targetUri)]
+          return help
         }
-      }
+      },
+      '(', ','
     )
   )
 
