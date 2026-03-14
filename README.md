@@ -1,6 +1,6 @@
 # TypeScript/JavaScript Notebook Support
 
-Minimal VS Code extension that provides cross-cell TypeScript/JavaScript diagnostics in Jupyter notebooks by
+VS Code extension that provides cross-cell TypeScript/JavaScript diagnostics in Jupyter notebooks by
 concatenating all TypeScript/JavaScript cells into a virtual document analyzed by the TypeScript language server.
 
 ## How It Works

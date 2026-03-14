@@ -6,7 +6,7 @@ const DIAG_COLLECTION = 'notebook-ts'
 const CONFIG_SECTION = 'notebookTs'
 const CONFIG_TYPE_ROOTS = 'typeRoots'
 const CONFIG_TSCONFIG = 'tsconfigPath'
-const VIRTUAL_DIR = 'notebook-ts'
+const VIRTUAL_DIR = '.notebook-ts'
 const UPDATE_DEBOUNCE_MS = 200
 const BACKGROUND_FLUSH_MS = 500
 
@@ -62,6 +62,7 @@ export function activate(context: vscode.ExtensionContext) {
 
   const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left)
   status.text = 'TypeScript Notebook: active'
+  status.command = 'notebookTs.restart'
   status.show()
   context.subscriptions.push(status)
 
@@ -84,6 +85,90 @@ export function activate(context: vscode.ExtensionContext) {
       return vscode.Uri.file(filePath)
     }
     return vscode.Uri.from({ scheme: SCHEME, path: `/${id}.ts` })
+  }
+
+  async function cleanupVirtualDirs(): Promise<void> {
+    for (const ws of vscode.workspace.workspaceFolders ?? []) {
+      const dir = vscode.Uri.file(path.join(ws.uri.fsPath, VIRTUAL_DIR))
+      try {
+        await vscode.workspace.fs.delete(dir, { recursive: true, useTrash: false })
+      } catch {
+        // ignore missing dir
+      }
+    }
+  }
+
+  function clearAllState(): void {
+    for (const timer of updateTimers.values()) {
+      clearTimeout(timer)
+    }
+    for (const timer of backgroundTimers.values()) {
+      clearTimeout(timer)
+    }
+    updateTimers.clear()
+    backgroundTimers.clear()
+    stateByNotebook.clear()
+    pendingByNotebook.clear()
+    dirtyCells.clear()
+    dirtyNotebooks.clear()
+    diagnostics.clear()
+  }
+
+  async function restartExtensionState(): Promise<void> {
+    clearAllState()
+    await cleanupVirtualDirs()
+    for (const nb of vscode.workspace.notebookDocuments) {
+      await ensureVirtualDocument(nb)
+    }
+  }
+
+  function configuredTsconfigPath(nb: vscode.NotebookDocument): string | null {
+    const ws = vscode.workspace.getWorkspaceFolder(nb.uri)
+    if (!ws) return null
+    const cfg = vscode.workspace.getConfiguration(CONFIG_SECTION, nb.uri)
+    const tsconfigPath = cfg.get<string>(CONFIG_TSCONFIG, '')
+    if (!tsconfigPath) {
+      return path.join(ws.uri.fsPath, 'tsconfig.json')
+    }
+    return path.isAbsolute(tsconfigPath) ? tsconfigPath : path.join(ws.uri.fsPath, tsconfigPath)
+  }
+
+  function normalizePathForTsconfig(value: string): string {
+    return value.replace(/\\/g, '/')
+  }
+
+  async function updateVirtualTsconfig(nb: vscode.NotebookDocument, vuri: vscode.Uri): Promise<void> {
+    if (vuri.scheme !== 'file') return
+    const sourcePath = configuredTsconfigPath(nb)
+    if (!sourcePath) return
+
+    let json: any
+    try {
+      const raw = await vscode.workspace.fs.readFile(vscode.Uri.file(sourcePath))
+      const text = Buffer.from(raw).toString('utf8')
+      json = JSON.parse(stripJsonComments(text))
+    } catch {
+      return
+    }
+
+    const sourceDir = path.dirname(sourcePath)
+    const virtualDir = path.dirname(vuri.fsPath)
+
+    const compilerOptions = (json?.compilerOptions && typeof json.compilerOptions === 'object') ? json.compilerOptions : {}
+    if (Array.isArray(compilerOptions.typeRoots)) {
+      compilerOptions.typeRoots = compilerOptions.typeRoots.map((root: string) => {
+        const abs = path.isAbsolute(root) ? root : path.join(sourceDir, root)
+        const rel = path.relative(virtualDir, abs) || '.'
+        return normalizePathForTsconfig(rel)
+      })
+    }
+    json.compilerOptions = compilerOptions
+
+    json.include = ['*.ts']
+
+    const targetPath = path.join(virtualDir, 'tsconfig.json')
+    const payload = `${JSON.stringify(json, null, 2)}\n`
+    await vscode.workspace.fs.writeFile(vscode.Uri.file(targetPath), Buffer.from(payload, 'utf8'))
   }
 
   function resolveTypeRootsFromConfig(nb: vscode.NotebookDocument): string[] {
@@ -204,6 +289,7 @@ export function activate(context: vscode.ExtensionContext) {
         // ignore
       }
       await vscode.workspace.fs.writeFile(vuri, Buffer.from(lines.join('\n')))
+      await updateVirtualTsconfig(nb, vuri)
     } else {
       provider.update(vuri, lines.join('\n'))
     }
@@ -592,6 +678,13 @@ export function activate(context: vscode.ExtensionContext) {
       output.appendLine('---')
       output.appendLine(state.lines.join('\n'))
       output.show(true)
+    })
+  )
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('notebookTs.restart', async () => {
+      await restartExtensionState()
+      vscode.window.showInformationMessage('TypeScript Notebook: reloaded')
     })
   )
 
