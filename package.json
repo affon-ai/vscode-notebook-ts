@@ -3,7 +3,7 @@
   "displayName": "TypeScript Notebook Support",
   "description": "Cross-cell TypeScript diagnostics for Jupyter notebooks.",
   "version": "0.0.1",
-  "publisher": "notebook-ts",
+  "publisher": "affon",
   "engines": {
     "vscode": "^1.90.0"
   },
