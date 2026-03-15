@@ -19,7 +19,8 @@ TypeScript notebook cells are adopted into the extension-owned `typescript-noteb
 
 3. **Language server interaction**
    - VS Code’s built‑in TypeScript extension (tsserver) analyzes the virtual file.
-  - The extension forwards requests (completion, hover, definition, declaration, implementation, type definition, inlay hints, signature help) to tsserver using `vscode.execute*` commands and maps results back to cells.
+   - The extension forwards completion, hover, definition, implementation, type definition, document highlights, and signature help through `vscode.execute*` commands and maps results back to cells.
+   - Inlay hints are produced through a local TypeScript language service over the generated virtual file.
 
 4. **Incremental sync**
    - Cell edits update only the affected slice of the virtual file.
@@ -50,9 +51,9 @@ npm run build
 
 ## Notes
 
-- Provides diagnostics, hover, definition, declaration, implementation, type definition, document highlights, completion (triggered on `.`), inlay hints, and signature help (triggered on `(` and `,`) mapped back to cells.
-- Duplicate top-level declaration diagnostics can be suppressed through notebook-specific diagnostic rules during mapping.
-- The extension writes a virtual TypeScript file under `./.notebook-ts/` in the workspace. If this folder is excluded by your `tsconfig` `include`, add it (e.g. `".notebook-ts/**/*.ts"`).
-- Autocomplete and signature help rely on the virtual file being included in the workspace TS project.
-- VS Code's built-in TypeScript diagnostics still run on each cell document independently, so some warnings (e.g. unused locals across cells) may appear even when the virtual doc is correct.
+- Provides diagnostics, hover, definition, implementation, type definition, document highlights, completion (triggered on `.`), inlay hints, and signature help (triggered on `(` and `,`) mapped back to cells.
+- `Go to Declaration` is still partial and not reliable enough to treat as a completed feature.
+- Duplicate top-level declaration diagnostics are filtered through notebook-specific suppression rules during mapping.
+- The extension writes generated analysis files under `./.notebook-ts/`, including a notebook-local `tsconfig.json`.
+- Same-type top-level rebinding across cells is supported through a virtual-file-only rewrite of top-level `const`/`let` bindings. Cross-type rebinding is still unsupported.
 - It does not use kernel runtime state; it is purely static analysis.
