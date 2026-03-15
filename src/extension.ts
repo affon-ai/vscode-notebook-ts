@@ -1,5 +1,7 @@
 import * as vscode from 'vscode'
 import * as path from 'path'
+import * as ts from 'typescript'
+import { createHash } from 'crypto'
 
 const SCHEME = 'notebook-ts'
 const DIAG_COLLECTION = 'notebook-ts'
@@ -7,8 +9,12 @@ const CONFIG_SECTION = 'notebookTs'
 const CONFIG_TYPE_ROOTS = 'typeRoots'
 const CONFIG_TSCONFIG = 'tsconfigPath'
 const VIRTUAL_DIR = '.notebook-ts'
+const NOTEBOOK_TS_LANGUAGE = 'typescript-notebook'
+const TS_LANGUAGE = 'typescript'
+const JS_LANGUAGE = 'javascript'
 const UPDATE_DEBOUNCE_MS = 200
 const BACKGROUND_FLUSH_MS = 500
+const SUPPRESSED_DUPLICATE_DECLARATION_CODES = new Set([2300, 2451])
 
 interface CellRange {
   cell: vscode.NotebookCell
@@ -20,7 +26,33 @@ interface NotebookState {
   virtualUri: vscode.Uri
   lines: string[]
   ranges: CellRange[]
-  headerLines: string[]
+}
+
+interface DiagnosticSuppressionContext {
+  notebookState: NotebookState
+  diagnostic: vscode.Diagnostic
+  mapped: { uri: vscode.Uri; range: vscode.Range } | null
+  cellRange: CellRange | null
+}
+
+interface DiagnosticSuppressionRule {
+  id: string
+  matches(ctx: DiagnosticSuppressionContext): boolean
+}
+
+interface TopLevelBindingStatement {
+  names: string[]
+  startLine: number
+  endLine: number
+}
+
+interface QueryStateDebugInfo {
+  relevantCells: Array<{
+    index: number
+    uri: string
+    statements: TopLevelBindingStatement[]
+    maskedStatementIndices: number[]
+  }>
 }
 
 class VirtualDocProvider implements vscode.TextDocumentContentProvider {
@@ -78,13 +110,17 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   function virtualUriFor(nb: vscode.NotebookDocument): vscode.Uri {
-    const id = Buffer.from(nb.uri.toString()).toString('base64').replace(/[/+=]/g, '_')
+    const id = createHash('sha1').update(nb.uri.toString()).digest('hex').slice(0, 16)
     const ws = vscode.workspace.getWorkspaceFolder(nb.uri)
     if (ws) {
       const filePath = path.join(ws.uri.fsPath, VIRTUAL_DIR, `${id}.ts`)
       return vscode.Uri.file(filePath)
     }
     return vscode.Uri.from({ scheme: SCHEME, path: `/${id}.ts` })
+  }
+
+  function virtualBaseNameForUri(uri: vscode.Uri): string {
+    return path.basename(uri.scheme === 'file' ? uri.fsPath : uri.path, '.ts')
   }
 
   async function cleanupVirtualDirs(): Promise<void> {
@@ -94,6 +130,66 @@ export function activate(context: vscode.ExtensionContext) {
         await vscode.workspace.fs.delete(dir, { recursive: true, useTrash: false })
       } catch {
         // ignore missing dir
+      }
+    }
+  }
+
+  async function cleanupVirtualFilesForNotebook(nb: vscode.NotebookDocument): Promise<void> {
+    const vuri = virtualUriFor(nb)
+    const key = notebookKey(nb)
+    const pending = pendingByNotebook.get(key)
+
+    stateByNotebook.delete(key)
+    pendingByNotebook.delete(key)
+    dirtyNotebooks.delete(key)
+
+    const updateTimer = updateTimers.get(key)
+    if (updateTimer) {
+      clearTimeout(updateTimer)
+      updateTimers.delete(key)
+    }
+
+    const backgroundTimer = backgroundTimers.get(key)
+    if (backgroundTimer) {
+      clearTimeout(backgroundTimer)
+      backgroundTimers.delete(key)
+    }
+
+    for (const cell of nb.getCells()) {
+      dirtyCells.delete(cell.document.uri.toString())
+      diagnostics.delete(cell.document.uri)
+    }
+
+    const candidates = new Set<string>([vuri.toString()])
+    if (pending) {
+      candidates.add(pending.virtualUri.toString())
+    }
+
+    if (vuri.scheme === 'file') {
+      const dir = vscode.Uri.file(path.dirname(vuri.fsPath))
+      const baseName = virtualBaseNameForUri(vuri)
+      try {
+        const entries = await vscode.workspace.fs.readDirectory(dir)
+        for (const [name, kind] of entries) {
+          if (kind !== vscode.FileType.File) continue
+          if (name === `${baseName}.ts` || name.startsWith(`${baseName}-cell-`) || name === 'tsconfig.json') {
+            candidates.add(vscode.Uri.file(path.join(dir.fsPath, name)).toString())
+          }
+        }
+      } catch {
+        // ignore missing dir
+      }
+    }
+
+    for (const ref of candidates) {
+      const uri = vscode.Uri.parse(ref)
+      try {
+        await vscode.workspace.fs.delete(uri, { useTrash: false })
+      } catch {
+        // ignore missing files
+      }
+      if (uri.scheme !== 'file') {
+        provider.update(uri, '')
       }
     }
   }
@@ -137,6 +233,139 @@ export function activate(context: vscode.ExtensionContext) {
     return value.replace(/\\/g, '/')
   }
 
+  function toArrayOfStrings(value: unknown): string[] {
+    return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : []
+  }
+
+  function getTypeScriptInlayPreferences(resource: vscode.Uri): ts.UserPreferences {
+    const config = vscode.workspace.getConfiguration(undefined, resource)
+    return {
+      includeInlayParameterNameHints: config.get<'none' | 'literals' | 'all'>('js/ts.inlayHints.parameterNames.enabled', 'none'),
+      includeInlayParameterNameHintsWhenArgumentMatchesName: !config.get<boolean>('js/ts.inlayHints.parameterNames.suppressWhenArgumentMatchesName', true),
+      includeInlayFunctionParameterTypeHints: config.get<boolean>('js/ts.inlayHints.parameterTypes.enabled', false),
+      includeInlayVariableTypeHints: config.get<boolean>('js/ts.inlayHints.variableTypes.enabled', false),
+      includeInlayVariableTypeHintsWhenTypeMatchesName: !config.get<boolean>('js/ts.inlayHints.variableTypes.suppressWhenTypeMatchesName', true),
+      includeInlayPropertyDeclarationTypeHints: config.get<boolean>('js/ts.inlayHints.propertyDeclarationTypes.enabled', false),
+      includeInlayFunctionLikeReturnTypeHints: config.get<boolean>('js/ts.inlayHints.functionLikeReturnTypes.enabled', false),
+      includeInlayEnumMemberValueHints: config.get<boolean>('js/ts.inlayHints.enumMemberValues.enabled', false),
+      interactiveInlayHints: true
+    }
+  }
+
+  function hasAnyTypeScriptInlayHintsEnabled(resource: vscode.Uri): boolean {
+    const prefs = getTypeScriptInlayPreferences(resource)
+    return (
+      prefs.includeInlayParameterNameHints !== 'none' ||
+      !!prefs.includeInlayFunctionParameterTypeHints ||
+      !!prefs.includeInlayVariableTypeHints ||
+      !!prefs.includeInlayPropertyDeclarationTypeHints ||
+      !!prefs.includeInlayFunctionLikeReturnTypeHints ||
+      !!prefs.includeInlayEnumMemberValueHints
+    )
+  }
+
+  function getParsedNotebookTsConfig(vuri: vscode.Uri): { parsed: ts.ParsedCommandLine; tsconfigPath: string } | null {
+    if (vuri.scheme !== 'file') return null
+    const tsconfigPath = path.join(path.dirname(vuri.fsPath), 'tsconfig.json')
+    const parsed = ts.getParsedCommandLineOfConfigFile(tsconfigPath, {}, {
+      ...ts.sys,
+      onUnRecoverableConfigFileDiagnostic: () => {}
+    })
+    if (!parsed) return null
+    return { parsed, tsconfigPath }
+  }
+
+  function createNotebookLanguageService(vuri: vscode.Uri): { service: ts.LanguageService; fileName: string } | null {
+    const parsedConfig = getParsedNotebookTsConfig(vuri)
+    if (!parsedConfig) return null
+
+    const fileVersions = new Map<string, string>()
+    for (const fileName of parsedConfig.parsed.fileNames) {
+      try {
+        const stat = ts.sys.getModifiedTime?.(fileName)
+        fileVersions.set(fileName, stat ? String(stat.getTime()) : '0')
+      } catch {
+        fileVersions.set(fileName, '0')
+      }
+    }
+
+    const host: ts.LanguageServiceHost = {
+      getCompilationSettings: () => parsedConfig.parsed.options,
+      getScriptFileNames: () => parsedConfig.parsed.fileNames,
+      getScriptVersion: fileName => fileVersions.get(fileName) ?? '0',
+      getScriptSnapshot: fileName => {
+        const text = ts.sys.readFile(fileName)
+        return text === undefined ? undefined : ts.ScriptSnapshot.fromString(text)
+      },
+      getCurrentDirectory: () => path.dirname(parsedConfig.tsconfigPath),
+      getDefaultLibFileName: options => ts.getDefaultLibFilePath(options),
+      fileExists: ts.sys.fileExists,
+      readFile: ts.sys.readFile,
+      readDirectory: ts.sys.readDirectory,
+      directoryExists: ts.sys.directoryExists?.bind(ts.sys),
+      getDirectories: ts.sys.getDirectories?.bind(ts.sys)
+    }
+
+    return {
+      service: ts.createLanguageService(host),
+      fileName: vuri.fsPath
+    }
+  }
+
+  function mapTypeScriptInlayKind(kind: ts.InlayHintKind): vscode.InlayHintKind | undefined {
+    switch (kind) {
+      case ts.InlayHintKind.Parameter:
+        return vscode.InlayHintKind.Parameter
+      case ts.InlayHintKind.Type:
+        return vscode.InlayHintKind.Type
+      default:
+        return undefined
+    }
+  }
+
+  function provideNotebookInlayHints(
+    doc: vscode.TextDocument,
+    state: NotebookState,
+    cell: vscode.NotebookCell,
+    range: vscode.Range
+  ): vscode.InlayHint[] | undefined {
+    if (!hasAnyTypeScriptInlayHintsEnabled(doc.uri)) return undefined
+    if (state.virtualUri.scheme !== 'file') return undefined
+    const serviceEntry = createNotebookLanguageService(state.virtualUri)
+    if (!serviceEntry) return undefined
+
+    const program = serviceEntry.service.getProgram()
+    const sourceFile = program?.getSourceFile(serviceEntry.fileName)
+    if (!sourceFile) return undefined
+
+    const start = mapCellPositionToVirtual(state, cell, range.start)
+    const end = mapCellPositionToVirtual(state, cell, range.end)
+    if (!start || !end) return undefined
+    const lineStarts = sourceFile.getLineStarts()
+    if (start.line >= lineStarts.length || end.line >= lineStarts.length) return undefined
+
+    const spanStart = sourceFile.getPositionOfLineAndCharacter(start.line, start.character)
+    const spanEnd = sourceFile.getPositionOfLineAndCharacter(end.line, end.character)
+    const preferences = getTypeScriptInlayPreferences(doc.uri)
+    const hints = serviceEntry.service.provideInlayHints(serviceEntry.fileName, { start: spanStart, length: spanEnd - spanStart }, preferences)
+
+    return hints
+      .map(hint => {
+        const loc = sourceFile.getLineAndCharacterOfPosition(hint.position)
+        const mapped = mapVirtualPositionToCell(state, new vscode.Position(loc.line, loc.character))
+        if (!mapped || mapped.uri.toString() !== doc.uri.toString()) return null
+
+        const label = hint.displayParts && hint.displayParts.length > 0
+          ? hint.displayParts.map(part => new vscode.InlayHintLabelPart(part.text))
+          : hint.text
+        const mappedHint = new vscode.InlayHint(mapped.position, label, mapTypeScriptInlayKind(hint.kind))
+        mappedHint.paddingLeft = hint.whitespaceBefore
+        mappedHint.paddingRight = hint.whitespaceAfter
+        return mappedHint
+      })
+      .filter((hint): hint is vscode.InlayHint => hint !== null)
+  }
+
   async function updateVirtualTsconfig(nb: vscode.NotebookDocument, vuri: vscode.Uri): Promise<void> {
     if (vuri.scheme !== 'file') return
     const sourcePath = configuredTsconfigPath(nb)
@@ -155,16 +384,26 @@ export function activate(context: vscode.ExtensionContext) {
     const virtualDir = path.dirname(vuri.fsPath)
 
     const compilerOptions = (json?.compilerOptions && typeof json.compilerOptions === 'object') ? json.compilerOptions : {}
+    const rebasedTypeRoots: string[] = []
     if (Array.isArray(compilerOptions.typeRoots)) {
       compilerOptions.typeRoots = compilerOptions.typeRoots.map((root: string) => {
         const abs = path.isAbsolute(root) ? root : path.join(sourceDir, root)
         const rel = path.relative(virtualDir, abs) || '.'
-        return normalizePathForTsconfig(rel)
+        const normalized = normalizePathForTsconfig(rel)
+        rebasedTypeRoots.push(normalized)
+        return normalized
       })
     }
     json.compilerOptions = compilerOptions
 
-    json.include = ['*.ts']
+    const rebasedIncludes = toArrayOfStrings(json.include).map(entry => {
+      const abs = path.isAbsolute(entry) ? entry : path.join(sourceDir, entry)
+      const rel = path.relative(virtualDir, abs) || '.'
+      return normalizePathForTsconfig(rel)
+    })
+
+    const typeRootIncludes = rebasedTypeRoots.map(root => normalizePathForTsconfig(path.posix.join(root, '**/*.d.ts')))
+    json.include = Array.from(new Set(['*.ts', ...rebasedIncludes, ...typeRootIncludes]))
 
     const targetPath = path.join(virtualDir, 'tsconfig.json')
     const payload = `${JSON.stringify(json, null, 2)}\n`
@@ -180,7 +419,23 @@ export function activate(context: vscode.ExtensionContext) {
   }
 
   function isTsLikeLanguage(id: string): boolean {
-    return id === 'typescript' || id === 'javascript'
+    return id === TS_LANGUAGE || id === NOTEBOOK_TS_LANGUAGE || id === JS_LANGUAGE
+  }
+
+  function shouldAdoptNotebookTsLanguage(doc: vscode.TextDocument): boolean {
+    return doc.uri.scheme === 'vscode-notebook-cell' && doc.languageId === TS_LANGUAGE
+  }
+
+  async function adoptNotebookCellLanguage(doc: vscode.TextDocument): Promise<void> {
+    if (!shouldAdoptNotebookTsLanguage(doc)) return
+    await vscode.languages.setTextDocumentLanguage(doc, NOTEBOOK_TS_LANGUAGE)
+  }
+
+  async function adoptNotebookLanguages(nb: vscode.NotebookDocument): Promise<void> {
+    for (const cell of nb.getCells()) {
+      if (cell.kind !== vscode.NotebookCellKind.Code) continue
+      await adoptNotebookCellLanguage(cell.document)
+    }
   }
 
   async function resolveTypeRootsFromTsconfig(nb: vscode.NotebookDocument): Promise<{ roots: string[]; usedPath: string | null }> {
@@ -214,53 +469,31 @@ export function activate(context: vscode.ExtensionContext) {
     return { roots: resolveTypeRootsFromConfig(nb), usedPath: null }
   }
 
-  async function resolveTypeReferences(nb: vscode.NotebookDocument): Promise<{ lines: string[]; usedTsconfig: string | null; roots: string[] }> {
+  async function resolveTypeReferences(nb: vscode.NotebookDocument): Promise<{ usedTsconfig: string | null; roots: string[] }> {
     const resolved = await resolveTypeRoots(nb)
-    const roots = resolved.roots
-    if (roots.length === 0) return { lines: [], usedTsconfig: resolved.usedPath, roots }
-
-    const lines: string[] = []
-    for (const root of roots) {
-      const dirUri = vscode.Uri.file(root)
-      try {
-        const entries = await vscode.workspace.fs.readDirectory(dirUri)
-        const files = entries
-          .filter(([name, kind]) => kind === vscode.FileType.File && name.endsWith('.d.ts'))
-          .map(([name]) => name)
-          .sort()
-
-        for (const name of files) {
-          const abs = path.join(root, name)
-          lines.push(`/// <reference path=\"${abs}\" />`)
-        }
-      } catch {
-        // ignore missing roots
-      }
-    }
-
-    return { lines, usedTsconfig: resolved.usedPath, roots }
+    return { usedTsconfig: resolved.usedPath, roots: resolved.roots }
   }
 
-  function buildVirtualContent(nb: vscode.NotebookDocument, headerLines: string[]): { lines: string[]; ranges: CellRange[] } {
+  function buildVirtualContent(nb: vscode.NotebookDocument): { lines: string[]; ranges: CellRange[] } {
+    return buildVirtualContentForCells(
+      nb.getCells().filter(cell => cell.kind === vscode.NotebookCellKind.Code && isTsLikeLanguage(cell.document.languageId))
+    )
+  }
+
+  function buildVirtualContentForCells(
+    cells: readonly vscode.NotebookCell[],
+    textOverrides = new Map<string, string>()
+  ): { lines: string[]; ranges: CellRange[] } {
     let line = 0
     const ranges: CellRange[] = []
     const parts: string[] = []
 
-    if (headerLines.length > 0) {
-      parts.push(...headerLines)
-      line += headerLines.length
-      parts.push('')
-      line += 1
-    }
-
-    nb.getCells().forEach((cell, idx) => {
-      if (cell.kind !== vscode.NotebookCellKind.Code) return
-      if (!isTsLikeLanguage(cell.document.languageId)) return
-
-      parts.push(`// Cell ${idx + 1}`)
+    cells.forEach(cell => {
+      parts.push(`// Cell ${cell.index + 1}`)
       line += 1
 
-      const text = cell.document.getText()
+      const originalText = textOverrides.get(cell.document.uri.toString()) ?? cell.document.getText()
+      const text = rewriteTopLevelBindingsForNotebook(originalText)
       const lines = text.split(/\r?\n/)
       const startLine = line
       const endLine = startLine + Math.max(lines.length - 1, 0)
@@ -273,14 +506,172 @@ export function activate(context: vscode.ExtensionContext) {
       parts.push('')
       line += 1
     })
-
     return { lines: parts, ranges }
+  }
+
+  function rewriteTopLevelBindingsForNotebook(text: string): string {
+    const sourceFile = ts.createSourceFile('cell.ts', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+    const replacements: Array<{ start: number; end: number; text: string }> = []
+
+    for (const statement of sourceFile.statements) {
+      if (!ts.isVariableStatement(statement)) continue
+      const start = statement.declarationList.getStart(sourceFile)
+      if (text.slice(start, start + 5) === 'const') {
+        replacements.push({ start, end: start + 5, text: 'var  ' })
+        continue
+      }
+      if (text.slice(start, start + 3) === 'let') {
+        replacements.push({ start, end: start + 3, text: 'var' })
+      }
+    }
+
+    if (replacements.length === 0) return text
+
+    let next = text
+    for (const replacement of replacements.sort((a, b) => b.start - a.start)) {
+      next = next.slice(0, replacement.start) + replacement.text + next.slice(replacement.end)
+    }
+    return next
+  }
+
+  function collectBindingNames(name: ts.BindingName, out: string[]): void {
+    if (ts.isIdentifier(name)) {
+      out.push(name.text)
+      return
+    }
+    for (const element of name.elements) {
+      if (ts.isOmittedExpression(element)) continue
+      collectBindingNames(element.name, out)
+    }
+  }
+
+  function topLevelBindingStatements(text: string): TopLevelBindingStatement[] {
+    const sourceFile = ts.createSourceFile('cell.ts', text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+    const statements: TopLevelBindingStatement[] = []
+
+    for (const statement of sourceFile.statements) {
+      if (!ts.isVariableStatement(statement)) continue
+      const names: string[] = []
+      for (const declaration of statement.declarationList.declarations) {
+        collectBindingNames(declaration.name, names)
+      }
+      if (names.length === 0) continue
+      const start = sourceFile.getLineAndCharacterOfPosition(statement.getStart(sourceFile))
+      const end = sourceFile.getLineAndCharacterOfPosition(statement.getEnd())
+      statements.push({
+        names,
+        startLine: start.line,
+        endLine: end.line
+      })
+    }
+
+    return statements
+  }
+
+  function maskTextLines(text: string, startLine: number, endLine: number): string {
+    const lines = text.split(/\r?\n/)
+    for (let i = startLine; i <= endLine && i < lines.length; i += 1) {
+      lines[i] = lines[i].replace(/[^\r\n]/g, ' ')
+    }
+    return lines.join('\n')
+  }
+
+  function buildQueryStateForCell(baseState: NotebookState, targetCell: vscode.NotebookCell): NotebookState {
+    return buildQueryStateForCellWithDebug(baseState, targetCell).state
+  }
+
+  function buildQueryStateForCellWithDebug(
+    baseState: NotebookState,
+    targetCell: vscode.NotebookCell
+  ): { state: NotebookState; debug: QueryStateDebugInfo } {
+    const relevantCells = targetCell.notebook.getCells().filter(cell =>
+      cell.kind === vscode.NotebookCellKind.Code &&
+      isTsLikeLanguage(cell.document.languageId) &&
+      cell.index <= targetCell.index
+    )
+
+    const shadowedStatements = new Map<string, Set<number>>()
+    const latestByName = new Map<string, { cellUri: string; statementIndex: number }>()
+    const cellStatements = new Map<string, TopLevelBindingStatement[]>()
+
+    for (const cell of relevantCells) {
+      const cellUri = cell.document.uri.toString()
+      const statements = topLevelBindingStatements(cell.document.getText())
+      cellStatements.set(cellUri, statements)
+
+      statements.forEach((statement, statementIndex) => {
+        for (const name of statement.names) {
+          const previous = latestByName.get(name)
+          if (previous) {
+            const masked = shadowedStatements.get(previous.cellUri) ?? new Set<number>()
+            masked.add(previous.statementIndex)
+            shadowedStatements.set(previous.cellUri, masked)
+          }
+          latestByName.set(name, { cellUri, statementIndex })
+        }
+      })
+    }
+
+    const textOverrides = new Map<string, string>()
+    const debugCells: QueryStateDebugInfo['relevantCells'] = []
+    for (const cell of relevantCells) {
+      const cellUri = cell.document.uri.toString()
+      const maskedIndices = shadowedStatements.get(cellUri)
+      const statements = cellStatements.get(cellUri) ?? []
+      debugCells.push({
+        index: cell.index,
+        uri: cellUri,
+        statements,
+        maskedStatementIndices: maskedIndices ? [...maskedIndices].sort((a, b) => a - b) : []
+      })
+      if (!maskedIndices || maskedIndices.size === 0) continue
+
+      let text = cell.document.getText()
+      for (const statementIndex of [...maskedIndices].sort((a, b) => b - a)) {
+        const statement = statements[statementIndex]
+        if (!statement) continue
+        text = maskTextLines(text, statement.startLine, statement.endLine)
+      }
+      textOverrides.set(cellUri, text)
+    }
+
+    const { lines, ranges } = buildVirtualContentForCells(relevantCells, textOverrides)
+    const baseName = path.basename(baseState.virtualUri.path, '.ts') || 'notebook'
+    const virtualUri = baseState.virtualUri.scheme === 'file'
+      ? vscode.Uri.file(path.join(path.dirname(baseState.virtualUri.fsPath), `${baseName}-cell-${targetCell.index}.ts`))
+      : vscode.Uri.from({ scheme: SCHEME, path: `/${baseName}-cell-${targetCell.index}.ts` })
+
+    return {
+      state: {
+        virtualUri,
+        lines,
+        ranges
+      },
+      debug: {
+        relevantCells: debugCells
+      }
+    }
+  }
+
+  async function prepareQueryState(
+    doc: vscode.TextDocument
+  ): Promise<{ state: NotebookState; cell: vscode.NotebookCell } | null> {
+    const match = findNotebookStateForCell(doc)
+    if (!match) return null
+    if (dirtyCells.has(doc.uri.toString())) {
+      await flushCellUpdate(doc)
+    }
+    if (dirtyNotebooks.has(notebookKey(match.cell.notebook))) {
+      await flushPending(match.cell.notebook)
+    }
+    const fresh = findNotebookStateForCell(doc) ?? match
+    return { state: fresh.state, cell: fresh.cell }
   }
 
   async function ensureVirtualDocument(nb: vscode.NotebookDocument) {
     const vuri = virtualUriFor(nb)
     const resolved = await resolveTypeReferences(nb)
-    const { lines, ranges } = buildVirtualContent(nb, resolved.lines)
+    const { lines, ranges } = buildVirtualContent(nb)
     if (vuri.scheme === 'file') {
       const dir = vscode.Uri.file(path.dirname(vuri.fsPath))
       try {
@@ -295,20 +686,25 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     const key = notebookKey(nb)
-    stateByNotebook.set(key, { virtualUri: vuri, lines, ranges, headerLines: resolved.lines })
+    stateByNotebook.set(key, { virtualUri: vuri, lines, ranges })
+    if (vuri.scheme !== 'file') {
+      await ensureVirtualTextDocument(vuri)
+    }
+  }
 
-    const doc = await vscode.workspace.openTextDocument(vuri)
-    await vscode.languages.setTextDocumentLanguage(doc, 'typescript')
+  async function ensureVirtualTextDocument(uri: vscode.Uri): Promise<void> {
+    const doc = await vscode.workspace.openTextDocument(uri)
+    if (uri.scheme !== 'file') {
+      await vscode.languages.setTextDocumentLanguage(doc, TS_LANGUAGE)
+    }
   }
 
   async function updateVirtualFile(uri: vscode.Uri, content: string): Promise<void> {
-    const doc = await vscode.workspace.openTextDocument(uri)
-    const lastLine = Math.max(0, doc.lineCount - 1)
-    const endChar = doc.lineCount > 0 ? doc.lineAt(lastLine).text.length : 0
-    const fullRange = new vscode.Range(new vscode.Position(0, 0), new vscode.Position(lastLine, endChar))
-    const edit = new vscode.WorkspaceEdit()
-    edit.replace(uri, fullRange, content)
-    await vscode.workspace.applyEdit(edit)
+    if (uri.scheme === 'file') {
+      await vscode.workspace.fs.writeFile(uri, Buffer.from(content))
+      return
+    }
+    provider.update(uri, content)
   }
 
   async function applyCellUpdate(cellDoc: vscode.TextDocument): Promise<boolean> {
@@ -326,19 +722,11 @@ export function activate(context: vscode.ExtensionContext) {
 
     const oldLineCount = oldEnd - oldStart + 1
     const newText = cellDoc.getText()
-    const newLines = newText.split(/\r?\n/)
-
-    const oldEndChar = lines[oldEnd]?.length ?? 0
-    const replaceRange = new vscode.Range(
-      new vscode.Position(oldStart, 0),
-      new vscode.Position(oldEnd, oldEndChar)
-    )
-
-    const edit = new vscode.WorkspaceEdit()
-    edit.replace(state.virtualUri, replaceRange, newText)
-    await vscode.workspace.applyEdit(edit)
+    const rewrittenText = rewriteTopLevelBindingsForNotebook(newText)
+    const newLines = rewrittenText.split(/\r?\n/)
 
     lines.splice(oldStart, oldLineCount, ...newLines)
+    await updateVirtualFile(state.virtualUri, lines.join('\n'))
 
     const delta = newLines.length - oldLineCount
     const updatedRanges = state.ranges.map(r => {
@@ -360,12 +748,11 @@ export function activate(context: vscode.ExtensionContext) {
     })
 
     const key = notebookKey(match.cell.notebook)
-    stateByNotebook.set(key, {
-      virtualUri: state.virtualUri,
-      lines,
-      ranges: updatedRanges,
-      headerLines: state.headerLines
-    })
+      stateByNotebook.set(key, {
+        virtualUri: state.virtualUri,
+        lines,
+        ranges: updatedRanges
+      })
     dirtyCells.delete(cellDoc.uri.toString())
     return true
   }
@@ -406,9 +793,8 @@ export function activate(context: vscode.ExtensionContext) {
     const key = notebookKey(nb)
     const existing = stateByNotebook.get(key)
     const vuri = existing?.virtualUri ?? virtualUriFor(nb)
-    const headerLines = existing?.headerLines ?? []
-    const { lines, ranges } = buildVirtualContent(nb, headerLines)
-    return { virtualUri: vuri, lines, ranges, headerLines }
+    const { lines, ranges } = buildVirtualContent(nb)
+    return { virtualUri: vuri, lines, ranges }
   }
 
   async function updateFromNotebook(nb: vscode.NotebookDocument) {
@@ -459,24 +845,58 @@ export function activate(context: vscode.ExtensionContext) {
     const map = new Map<string, vscode.Diagnostic[]>()
     const ranges = nbState.ranges
 
+    const suppressionRules: readonly DiagnosticSuppressionRule[] = [
+      {
+        id: 'duplicate-top-level-binding',
+        matches(ctx) {
+          const code = typeof ctx.diagnostic.code === 'number'
+            ? ctx.diagnostic.code
+            : typeof ctx.diagnostic.code === 'string'
+              ? Number(ctx.diagnostic.code)
+              : NaN
+          if (!SUPPRESSED_DUPLICATE_DECLARATION_CODES.has(code)) return false
+          if (!ctx.cellRange || !ctx.mapped) return false
+
+          const startLine = ctx.cellRange.startLine
+          const endLine = ctx.cellRange.endLine
+          const targetLine = ctx.diagnostic.range.start.line
+          if (targetLine < startLine || targetLine > endLine) return false
+
+          const cellLine = targetLine - startLine
+          const lineText = ctx.cellRange.cell.document.lineAt(cellLine).text
+          return /^\s*(export\s+)?(declare\s+)?(const|let|var|function|class)\b/.test(lineText)
+        }
+      }
+    ]
+
+    function shouldSuppressDiagnostic(ctx: DiagnosticSuppressionContext): boolean {
+      return suppressionRules.some(rule => rule.matches(ctx))
+    }
+
     for (const d of diags) {
       if (d.code === 6133) continue
       const line = d.range.start.line
       const range = ranges.find(r => line >= r.startLine && line <= r.endLine)
       if (!range) continue
 
-      const cellLine = line - range.startLine
-      const cellRange = new vscode.Range(
-        new vscode.Position(cellLine, d.range.start.character),
-        new vscode.Position(cellLine, d.range.end.character)
-      )
-      const mapped = new vscode.Diagnostic(cellRange, d.message, d.severity)
+      const mappedRange = mapVirtualRangeToCellRange(nbState, d.range)
+      if (!mappedRange) continue
+
+      const mapped = new vscode.Diagnostic(mappedRange.range, d.message, d.severity)
       mapped.code = d.code
       mapped.source = d.source
       mapped.relatedInformation = d.relatedInformation
       mapped.tags = d.tags
 
-      const key = range.cell.document.uri.toString()
+      const suppressionContext: DiagnosticSuppressionContext = {
+        notebookState: nbState,
+        diagnostic: d,
+        mapped: mappedRange,
+        cellRange: range
+      }
+      if (shouldSuppressDiagnostic(suppressionContext)) continue
+
+      const key = mappedRange.uri.toString()
       const arr = map.get(key) ?? []
       arr.push(mapped)
       map.set(key, arr)
@@ -516,14 +936,34 @@ export function activate(context: vscode.ExtensionContext) {
     return { uri: start.uri, range: new vscode.Range(start.position, end.position) }
   }
 
+  function isNotebookVirtualUriForState(state: NotebookState, uri: vscode.Uri): boolean {
+    if (uri.toString() === state.virtualUri.toString()) return true
+
+    if (state.virtualUri.scheme === 'file' && uri.scheme === 'file') {
+      const stateDir = path.dirname(state.virtualUri.fsPath)
+      const stateBase = path.basename(state.virtualUri.fsPath, '.ts')
+      const candidateDir = path.dirname(uri.fsPath)
+      const candidateBase = path.basename(uri.fsPath, '.ts')
+      return candidateDir === stateDir && (candidateBase === stateBase || candidateBase.startsWith(`${stateBase}-cell-`))
+    }
+
+    if (state.virtualUri.scheme === uri.scheme) {
+      const stateBase = path.basename(state.virtualUri.path, '.ts')
+      const candidateBase = path.basename(uri.path, '.ts')
+      return candidateBase === stateBase || candidateBase.startsWith(`${stateBase}-cell-`)
+    }
+
+    return false
+  }
+
   function mapLocationToCell(state: NotebookState, loc: vscode.Location | vscode.LocationLink): vscode.Location | vscode.LocationLink {
     if ('uri' in loc) {
-      if (loc.uri.toString() !== state.virtualUri.toString()) return loc
+      if (!isNotebookVirtualUriForState(state, loc.uri)) return loc
       const mapped = mapVirtualRangeToCellRange(state, loc.range)
       if (!mapped) return loc
       return new vscode.Location(mapped.uri, mapped.range)
     }
-    if (loc.targetUri.toString() !== state.virtualUri.toString()) return loc
+    if (!isNotebookVirtualUriForState(state, loc.targetUri)) return loc
     const targetRange = mapVirtualRangeToCellRange(state, loc.targetRange)
     const targetSelection = mapVirtualRangeToCellRange(state, loc.targetSelectionRange ?? loc.targetRange)
     if (!targetRange || !targetSelection) return loc
@@ -586,17 +1026,70 @@ export function activate(context: vscode.ExtensionContext) {
     return item
   }
 
+  function mapInlayHintLabelPartToCell(
+    state: NotebookState,
+    part: vscode.InlayHintLabelPart
+  ): vscode.InlayHintLabelPart | null {
+    if (!part.location) return part
+    if (part.location.uri.toString() !== state.virtualUri.toString()) return part
+    const mapped = mapVirtualRangeToCellRange(state, part.location.range)
+    if (!mapped) return null
+    return {
+      ...part,
+      location: new vscode.Location(mapped.uri, mapped.range)
+    }
+  }
+
+  function mapInlayHintToCell(state: NotebookState, hint: vscode.InlayHint): vscode.InlayHint | null {
+    const mappedPosition = mapVirtualPositionToCell(state, hint.position)
+    if (!mappedPosition) return null
+
+    const mappedLabel = Array.isArray(hint.label)
+      ? hint.label
+          .map(part => mapInlayHintLabelPartToCell(state, part))
+          .filter((part): part is vscode.InlayHintLabelPart => part !== null)
+      : hint.label
+
+    const mappedHint = new vscode.InlayHint(mappedPosition.position, mappedLabel, hint.kind)
+    mappedHint.paddingLeft = hint.paddingLeft
+    mappedHint.paddingRight = hint.paddingRight
+    mappedHint.textEdits = hint.textEdits
+    mappedHint.tooltip = hint.tooltip
+    return mappedHint
+  }
+
   context.subscriptions.push(
+    vscode.languages.registerInlayHintsProvider(
+      [
+        { language: NOTEBOOK_TS_LANGUAGE, scheme: 'vscode-notebook-cell' },
+        { language: JS_LANGUAGE, scheme: 'vscode-notebook-cell' }
+      ],
+      {
+        async provideInlayHints(doc, range, _token) {
+          const query = await prepareQueryState(doc)
+          if (!query) return undefined
+          return provideNotebookInlayHints(doc, query.state, query.cell, range)
+        }
+      }
+    ),
     vscode.workspace.onDidOpenNotebookDocument(nb => {
-      ensureVirtualDocument(nb).catch(() => {})
+      adoptNotebookLanguages(nb)
+        .then(() => cleanupVirtualFilesForNotebook(nb))
+        .then(() => ensureVirtualDocument(nb))
+        .catch(() => {})
     }),
     vscode.workspace.onDidChangeNotebookDocument(e => {
       dirtyNotebooks.add(notebookKey(e.notebook))
+      adoptNotebookLanguages(e.notebook).catch(() => {})
       scheduleUpdate(e.notebook)
       scheduleBackgroundFlush(e.notebook)
     }),
     vscode.workspace.onDidChangeTextDocument(e => {
       if (e.document.uri.scheme !== 'vscode-notebook-cell') return
+      if (shouldAdoptNotebookTsLanguage(e.document)) {
+        adoptNotebookCellLanguage(e.document).catch(() => {})
+        return
+      }
       dirtyCells.add(e.document.uri.toString())
       const match = findNotebookStateForCell(e.document)
       if (match) {
@@ -692,8 +1185,8 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.languages.registerCompletionItemProvider(
       [
-        { language: 'typescript', scheme: 'vscode-notebook-cell' },
-        { language: 'javascript', scheme: 'vscode-notebook-cell' }
+        { language: NOTEBOOK_TS_LANGUAGE, scheme: 'vscode-notebook-cell' },
+        { language: JS_LANGUAGE, scheme: 'vscode-notebook-cell' }
       ],
       {
         async provideCompletionItems(doc, pos, _token, context) {
@@ -703,20 +1196,13 @@ export function activate(context: vscode.ExtensionContext) {
               return undefined
             }
           }
-          const match = findNotebookStateForCell(doc)
-          if (!match) return undefined
-          if (dirtyCells.has(doc.uri.toString())) {
-            await flushCellUpdate(doc)
-          }
-          if (dirtyNotebooks.has(notebookKey(match.cell.notebook))) {
-            await flushPending(match.cell.notebook)
-          }
-          const fresh = findNotebookStateForCell(doc) ?? match
-          const vpos = mapCellPositionToVirtual(fresh.state, fresh.cell, pos)
+          const query = await prepareQueryState(doc)
+          if (!query) return undefined
+          const vpos = mapCellPositionToVirtual(query.state, query.cell, pos)
           if (!vpos) return undefined
           const list = await vscode.commands.executeCommand<vscode.CompletionList>(
             'vscode.executeCompletionItemProvider',
-            fresh.state.virtualUri,
+            query.state.virtualUri,
             vpos,
             context.triggerCharacter,
             context.triggerKind
@@ -724,7 +1210,7 @@ export function activate(context: vscode.ExtensionContext) {
           if (!list) return list
 
           const items = list.items
-            .map(item => mapCompletionItemToCell(fresh.state, item))
+            .map(item => mapCompletionItemToCell(query.state, item))
             .filter((item): item is vscode.CompletionItem => item !== null)
 
           return new vscode.CompletionList(items, list.isIncomplete)
@@ -738,24 +1224,24 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.languages.registerHoverProvider(
       [
-        { language: 'typescript', scheme: 'vscode-notebook-cell' },
-        { language: 'javascript', scheme: 'vscode-notebook-cell' }
+        { language: NOTEBOOK_TS_LANGUAGE, scheme: 'vscode-notebook-cell' },
+        { language: JS_LANGUAGE, scheme: 'vscode-notebook-cell' }
       ],
       {
         async provideHover(doc, pos) {
-          const match = findNotebookStateForCell(doc)
-          if (!match) return undefined
-          const vpos = mapCellPositionToVirtual(match.state, match.cell, pos)
+          const query = await prepareQueryState(doc)
+          if (!query) return undefined
+          const vpos = mapCellPositionToVirtual(query.state, query.cell, pos)
           if (!vpos) return undefined
           const hover = await vscode.commands.executeCommand<vscode.Hover[]>(
             'vscode.executeHoverProvider',
-            match.state.virtualUri,
+            query.state.virtualUri,
             vpos
           )
           if (!hover || hover.length === 0) return undefined
           const h = hover[0]
           if (h.range) {
-            const mapped = mapVirtualRangeToCellRange(match.state, h.range)
+            const mapped = mapVirtualRangeToCellRange(query.state, h.range)
             if (mapped) return new vscode.Hover(h.contents, mapped.range)
           }
           return h
@@ -768,25 +1254,116 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.languages.registerDefinitionProvider(
       [
-        { language: 'typescript', scheme: 'vscode-notebook-cell' },
-        { language: 'javascript', scheme: 'vscode-notebook-cell' }
+        { language: NOTEBOOK_TS_LANGUAGE, scheme: 'vscode-notebook-cell' },
+        { language: JS_LANGUAGE, scheme: 'vscode-notebook-cell' }
       ],
       {
         async provideDefinition(doc, pos) {
-          const match = findNotebookStateForCell(doc)
-          if (!match) return undefined
-          const vpos = mapCellPositionToVirtual(match.state, match.cell, pos)
+          const query = await prepareQueryState(doc)
+          if (!query) return undefined
+          const vpos = mapCellPositionToVirtual(query.state, query.cell, pos)
           if (!vpos) return undefined
           const defs = await vscode.commands.executeCommand<vscode.Location[] | vscode.LocationLink[]>(
             'vscode.executeDefinitionProvider',
-            match.state.virtualUri,
+            query.state.virtualUri,
             vpos
           )
           if (!defs) return defs
           if (isLocationLinkArray(defs)) {
-            return defs.map(d => mapLocationToCell(match.state, d)) as vscode.LocationLink[]
+            return defs.map(d => mapLocationToCell(query.state, d)) as vscode.LocationLink[]
           }
-          return defs.map(d => mapLocationToCell(match.state, d)) as vscode.Location[]
+          return defs.map(d => mapLocationToCell(query.state, d)) as vscode.Location[]
+        }
+      }
+    )
+  )
+
+  // Implementation provider (basic mapping)
+  context.subscriptions.push(
+    vscode.languages.registerImplementationProvider(
+      [
+        { language: NOTEBOOK_TS_LANGUAGE, scheme: 'vscode-notebook-cell' },
+        { language: JS_LANGUAGE, scheme: 'vscode-notebook-cell' }
+      ],
+      {
+        async provideImplementation(doc, pos) {
+          const query = await prepareQueryState(doc)
+          if (!query) return undefined
+          const vpos = mapCellPositionToVirtual(query.state, query.cell, pos)
+          if (!vpos) return undefined
+          const impls = await vscode.commands.executeCommand<vscode.Location[] | vscode.LocationLink[]>(
+            'vscode.executeImplementationProvider',
+            query.state.virtualUri,
+            vpos
+          )
+          if (!impls) return impls
+          if (isLocationLinkArray(impls)) {
+            return impls.map(loc => mapLocationToCell(query.state, loc)) as vscode.LocationLink[]
+          }
+          return impls.map(loc => mapLocationToCell(query.state, loc)) as vscode.Location[]
+        }
+      }
+    )
+  )
+
+  // Type definition provider (basic mapping)
+  context.subscriptions.push(
+    vscode.languages.registerTypeDefinitionProvider(
+      [
+        { language: NOTEBOOK_TS_LANGUAGE, scheme: 'vscode-notebook-cell' },
+        { language: JS_LANGUAGE, scheme: 'vscode-notebook-cell' }
+      ],
+      {
+        async provideTypeDefinition(doc, pos) {
+          const query = await prepareQueryState(doc)
+          if (!query) return undefined
+          const vpos = mapCellPositionToVirtual(query.state, query.cell, pos)
+          if (!vpos) return undefined
+          const defs = await vscode.commands.executeCommand<vscode.Location[] | vscode.LocationLink[]>(
+            'vscode.executeTypeDefinitionProvider',
+            query.state.virtualUri,
+            vpos
+          )
+          if (!defs) return defs
+          if (isLocationLinkArray(defs)) {
+            return defs.map(loc => mapLocationToCell(query.state, loc)) as vscode.LocationLink[]
+          }
+          return defs.map(loc => mapLocationToCell(query.state, loc)) as vscode.Location[]
+        }
+      }
+    )
+  )
+
+  // Declaration provider (basic mapping)
+  context.subscriptions.push(
+    vscode.languages.registerDeclarationProvider(
+      [
+        { language: NOTEBOOK_TS_LANGUAGE, scheme: 'vscode-notebook-cell' },
+        { language: JS_LANGUAGE, scheme: 'vscode-notebook-cell' }
+      ],
+      {
+        async provideDeclaration(doc, pos) {
+          const query = await prepareQueryState(doc)
+          if (!query) return undefined
+          const vpos = mapCellPositionToVirtual(query.state, query.cell, pos)
+          if (!vpos) return undefined
+          const defs = await vscode.commands.executeCommand<vscode.Location[] | vscode.LocationLink[]>(
+            'vscode.executeDeclarationProvider',
+            query.state.virtualUri,
+            vpos
+          )
+          const resolvedDefs = defs && defs.length > 0
+            ? defs
+            : await vscode.commands.executeCommand<vscode.Location[] | vscode.LocationLink[]>(
+                'vscode.executeDefinitionProvider',
+                query.state.virtualUri,
+                vpos
+              )
+          if (!resolvedDefs) return resolvedDefs
+          if (isLocationLinkArray(resolvedDefs)) {
+            return resolvedDefs.map(loc => mapLocationToCell(query.state, loc)) as vscode.LocationLink[]
+          }
+          return resolvedDefs.map(loc => mapLocationToCell(query.state, loc)) as vscode.Location[]
         }
       }
     )
@@ -796,24 +1373,24 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.languages.registerDocumentHighlightProvider(
       [
-        { language: 'typescript', scheme: 'vscode-notebook-cell' },
-        { language: 'javascript', scheme: 'vscode-notebook-cell' }
+        { language: NOTEBOOK_TS_LANGUAGE, scheme: 'vscode-notebook-cell' },
+        { language: JS_LANGUAGE, scheme: 'vscode-notebook-cell' }
       ],
       {
         async provideDocumentHighlights(doc, pos) {
-          const match = findNotebookStateForCell(doc)
-          if (!match) return undefined
-          const vpos = mapCellPositionToVirtual(match.state, match.cell, pos)
+          const query = await prepareQueryState(doc)
+          if (!query) return undefined
+          const vpos = mapCellPositionToVirtual(query.state, query.cell, pos)
           if (!vpos) return undefined
           const highlights = await vscode.commands.executeCommand<vscode.DocumentHighlight[]>(
             'vscode.executeDocumentHighlights',
-            match.state.virtualUri,
+            query.state.virtualUri,
             vpos
           )
           if (!highlights) return highlights
           const mapped = highlights
             .map(h => {
-              const m = mapVirtualRangeToCellRange(match.state, h.range)
+              const m = mapVirtualRangeToCellRange(query.state, h.range)
               return m ? new vscode.DocumentHighlight(m.range, h.kind) : null
             })
             .filter((h): h is vscode.DocumentHighlight => h !== null)
@@ -827,25 +1404,18 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.languages.registerSignatureHelpProvider(
       [
-        { language: 'typescript', scheme: 'vscode-notebook-cell' },
-        { language: 'javascript', scheme: 'vscode-notebook-cell' }
+        { language: NOTEBOOK_TS_LANGUAGE, scheme: 'vscode-notebook-cell' },
+        { language: JS_LANGUAGE, scheme: 'vscode-notebook-cell' }
       ],
       {
         async provideSignatureHelp(doc, pos, _token, context) {
-          const match = findNotebookStateForCell(doc)
-          if (!match) return undefined
-          if (dirtyCells.has(doc.uri.toString())) {
-            await flushCellUpdate(doc)
-          }
-          if (dirtyNotebooks.has(notebookKey(match.cell.notebook))) {
-            await flushPending(match.cell.notebook)
-          }
-          const fresh = findNotebookStateForCell(doc) ?? match
-          const vpos = mapCellPositionToVirtual(fresh.state, fresh.cell, pos)
+          const query = await prepareQueryState(doc)
+          if (!query) return undefined
+          const vpos = mapCellPositionToVirtual(query.state, query.cell, pos)
           if (!vpos) return undefined
           const help = await vscode.commands.executeCommand<vscode.SignatureHelp>(
             'vscode.executeSignatureHelpProvider',
-            fresh.state.virtualUri,
+            query.state.virtualUri,
             vpos,
             context.triggerCharacter,
             context.isRetrigger
@@ -859,7 +1429,9 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Initialize for already-open notebooks
   vscode.workspace.notebookDocuments.forEach(nb => {
-    ensureVirtualDocument(nb).catch(() => {})
+    adoptNotebookLanguages(nb)
+      .then(() => ensureVirtualDocument(nb))
+      .catch(() => {})
   })
 }
 

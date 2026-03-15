@@ -3,12 +3,15 @@
 VS Code extension that provides cross-cell TypeScript/JavaScript diagnostics in Jupyter notebooks by
 concatenating all TypeScript/JavaScript cells into a virtual document analyzed by the TypeScript language server.
 
+TypeScript notebook cells are adopted into the extension-owned `typescript-notebook` language id so the extension can provide notebook-specific language features while still analyzing a generated virtual `.ts` file.
+
 ## How It Works
 
 1. **Virtual document build**
-   - All TypeScript/JavaScript code cells are concatenated into a single virtual `.ts` file.
-   - The virtual file is written to `./.notebook-ts/` in the workspace.
-   - `/// <reference ...>` lines are injected from `typeRoots` to load ambient typings.
+  - TypeScript notebook code cells are switched to `typescript-notebook`.
+  - TypeScript/JavaScript code cells are concatenated into a single virtual `.ts` file.
+  - The virtual file is written to `./.notebook-ts/` in the workspace.
+  - A generated virtual `tsconfig.json` carries project options like `typeRoots` for notebook analysis.
 
 2. **Line mapping**
    - The extension records a line range for each cell in the virtual document.
@@ -16,7 +19,7 @@ concatenating all TypeScript/JavaScript cells into a virtual document analyzed b
 
 3. **Language server interaction**
    - VS Code’s built‑in TypeScript extension (tsserver) analyzes the virtual file.
-   - The extension forwards requests (completion, hover, definition, signature help) to tsserver using `vscode.execute*` commands and maps results back to cells.
+  - The extension forwards requests (completion, hover, definition, declaration, implementation, type definition, inlay hints, signature help) to tsserver using `vscode.execute*` commands and maps results back to cells.
 
 4. **Incremental sync**
    - Cell edits update only the affected slice of the virtual file.
@@ -47,7 +50,8 @@ npm run build
 
 ## Notes
 
-- Provides diagnostics, hover, definition, document highlights, completion (triggered on `.`), and signature help (triggered on `(` and `,`) mapped back to cells.
+- Provides diagnostics, hover, definition, declaration, implementation, type definition, document highlights, completion (triggered on `.`), inlay hints, and signature help (triggered on `(` and `,`) mapped back to cells.
+- Duplicate top-level declaration diagnostics can be suppressed through notebook-specific diagnostic rules during mapping.
 - The extension writes a virtual TypeScript file under `./.notebook-ts/` in the workspace. If this folder is excluded by your `tsconfig` `include`, add it (e.g. `".notebook-ts/**/*.ts"`).
 - Autocomplete and signature help rely on the virtual file being included in the workspace TS project.
 - VS Code's built-in TypeScript diagnostics still run on each cell document independently, so some warnings (e.g. unused locals across cells) may appear even when the virtual doc is correct.

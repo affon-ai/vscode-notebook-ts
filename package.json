@@ -2,7 +2,7 @@
   "name": "vscode-notebook-ts",
   "displayName": "TypeScript/JavaScript Notebook Support",
   "description": "Cross-cell TypeScript diagnostics for Jupyter notebooks.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "affon",
   "repository": {
     "type": "git",
@@ -19,10 +19,19 @@
     "onStartupFinished",
     "onNotebook:jupyter-notebook",
     "onLanguage:typescript",
+    "onLanguage:typescript-notebook",
     "onCommand:notebookTs.dumpVirtualDoc"
   ],
   "contributes": {
     "languages": [
+      {
+        "id": "typescript-notebook",
+        "configuration": "./language-configuration-typescript-notebook.json",
+        "aliases": [
+          "TypeScript Notebook",
+          "ts-notebook"
+        ]
+      },
       {
         "id": "typescript",
         "extensions": [
@@ -32,6 +41,13 @@
           "TypeScript",
           "ts"
         ]
+      }
+    ],
+    "grammars": [
+      {
+        "language": "typescript-notebook",
+        "scopeName": "source.ts.notebook",
+        "path": "./syntaxes/typescript-notebook.tmLanguage.json"
       }
     ],
     "commands": [
@@ -61,6 +77,7 @@
   },
   "scripts": {
     "build": "tsc -p .",
+    "check:push": "./scripts/check-push.sh",
     "watch": "tsc -p . -w",
     "package": "npx @vscode/vsce package",
     "publish": "npx @vscode/vsce publish"
