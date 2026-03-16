@@ -14,6 +14,9 @@
   "categories": [
     "Other"
   ],
+  "extensionDependencies": [
+    "affon.jupyter"
+  ],
   "main": "./out/extension.js",
   "activationEvents": [
     "onStartupFinished",
@@ -78,6 +81,7 @@
   "scripts": {
     "build": "tsc -p .",
     "check:push": "./scripts/check-push.sh",
+    "release": "./scripts/release.sh",
     "watch": "tsc -p . -w",
     "package": "npx @vscode/vsce package",
     "publish": "npx @vscode/vsce publish"

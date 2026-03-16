@@ -33,6 +33,19 @@ npm install
 npm run build
 ```
 
+## Release
+
+This extension depends on `affon.jupyter`.
+
+- published install flow: installing `affon.vscode-notebook-ts` should pull in `affon.jupyter` through `extensionDependencies`
+- local VSIX install flow: install `affon-jupyter.vsix` first, then install `affon-vscode-notebook-ts.vsix`
+
+Package a release VSIX with:
+
+```bash
+npm run release
+```
+
 ## Run in VS Code
 
 - Open this repo in VS Code
