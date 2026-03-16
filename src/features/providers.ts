@@ -3,6 +3,94 @@ import * as vscode from 'vscode'
 import { JS_LANGUAGE, NOTEBOOK_TS_LANGUAGE } from '../core/constants'
 import { NotebookTsService } from '../core/notebookService'
 
+function isIdentifierChar(char: string): boolean {
+  return /[A-Za-z0-9_$]/.test(char)
+}
+
+function getIdentifierRangeForIndex(text: string, line: number, index: number): vscode.Range | undefined {
+  if (index < 0 || index >= text.length) return undefined
+  if (!isIdentifierChar(text[index] ?? '')) return undefined
+
+  let start = index
+  while (start > 0 && isIdentifierChar(text[start - 1] ?? '')) {
+    start -= 1
+  }
+
+  let end = index + 1
+  while (end < text.length && isIdentifierChar(text[end] ?? '')) {
+    end += 1
+  }
+
+  return new vscode.Range(new vscode.Position(line, start), new vscode.Position(line, end))
+}
+
+function getIdentifierRangeAtPosition(doc: vscode.TextDocument, pos: vscode.Position): vscode.Range | undefined {
+  const text = doc.lineAt(pos.line).text
+  if (!text) return undefined
+
+  const index = Math.min(pos.character, text.length - 1)
+  if (index < 0) return undefined
+
+  const current = text[index] ?? ''
+  const previous = text[index - 1] ?? ''
+  const next = text[index + 1] ?? ''
+
+  if (isIdentifierChar(current)) {
+    return getIdentifierRangeForIndex(text, pos.line, index)
+  }
+
+  if (isIdentifierChar(previous)) {
+    return getIdentifierRangeForIndex(text, pos.line, index - 1)
+  }
+
+  if (current === '.' && isIdentifierChar(next)) {
+    return getIdentifierRangeForIndex(text, pos.line, index + 1)
+  }
+
+  return undefined
+}
+
+function selectHoverRange(
+  doc: vscode.TextDocument,
+  pos: vscode.Position,
+  mappedRange?: vscode.Range
+): vscode.Range | undefined {
+  const identifierRange = getIdentifierRangeAtPosition(doc, pos)
+  if (!mappedRange) return identifierRange
+  if (!identifierRange) return mappedRange
+  if (!mappedRange.contains(pos)) return identifierRange
+  if (mappedRange.isEqual(identifierRange)) return mappedRange
+  if (mappedRange.contains(identifierRange.start) && mappedRange.contains(identifierRange.end)) {
+    return identifierRange
+  }
+  return mappedRange
+}
+
+function toLocationLinks(
+  doc: vscode.TextDocument,
+  pos: vscode.Position,
+  locations: vscode.Location[] | vscode.LocationLink[],
+  mapLocation: (loc: vscode.Location | vscode.LocationLink) => vscode.Location | vscode.LocationLink
+): vscode.LocationLink[] {
+  const originSelectionRange = getIdentifierRangeAtPosition(doc, pos)
+
+  return locations.map(location => {
+    const mapped = mapLocation(location)
+    if ('targetUri' in mapped) {
+      return {
+        ...mapped,
+        originSelectionRange: originSelectionRange ?? mapped.originSelectionRange
+      }
+    }
+    return {
+      originSelectionRange,
+      targetUri: mapped.uri,
+      targetRange: mapped.range,
+      targetSelectionRange: mapped.range
+    }
+  })
+}
+
 export function registerProviders(context: vscode.ExtensionContext, service: NotebookTsService): void {
   context.subscriptions.push(
     vscode.languages.registerInlayHintsProvider(
@@ -79,9 +167,15 @@ export function registerProviders(context: vscode.ExtensionContext, service: Not
           const first = hover[0]
           if (first.range) {
             const mapped = service.mapVirtualRangeToCellRange(query.state, first.range)
-            if (mapped) return new vscode.Hover(first.contents, mapped.range)
+            if (mapped) {
+              const range = selectHoverRange(doc, pos, mapped.range)
+              return new vscode.Hover(first.contents, range)
+            }
           }
-          return first
+          const fallbackRange = selectHoverRange(doc, pos)
+          return fallbackRange
+            ? new vscode.Hover(first.contents, fallbackRange)
+            : first
         }
       }
     )
@@ -105,10 +199,7 @@ export function registerProviders(context: vscode.ExtensionContext, service: Not
             vpos
           )
           if (!defs) return defs
-          if (service.isLocationLinkArray(defs)) {
-            return defs.map(d => service.mapLocationToCell(query.state, d)) as vscode.LocationLink[]
-          }
-          return defs.map(d => service.mapLocationToCell(query.state, d)) as vscode.Location[]
+          return toLocationLinks(doc, pos, defs, d => service.mapLocationToCell(query.state, d))
         }
       }
     )
@@ -132,10 +223,7 @@ export function registerProviders(context: vscode.ExtensionContext, service: Not
             vpos
           )
           if (!impls) return impls
-          if (service.isLocationLinkArray(impls)) {
-            return impls.map(loc => service.mapLocationToCell(query.state, loc)) as vscode.LocationLink[]
-          }
-          return impls.map(loc => service.mapLocationToCell(query.state, loc)) as vscode.Location[]
+          return toLocationLinks(doc, pos, impls, loc => service.mapLocationToCell(query.state, loc))
         }
       }
     )
@@ -159,10 +247,7 @@ export function registerProviders(context: vscode.ExtensionContext, service: Not
             vpos
           )
           if (!defs) return defs
-          if (service.isLocationLinkArray(defs)) {
-            return defs.map(loc => service.mapLocationToCell(query.state, loc)) as vscode.LocationLink[]
-          }
-          return defs.map(loc => service.mapLocationToCell(query.state, loc)) as vscode.Location[]
+          return toLocationLinks(doc, pos, defs, loc => service.mapLocationToCell(query.state, loc))
         }
       }
     )
@@ -193,10 +278,7 @@ export function registerProviders(context: vscode.ExtensionContext, service: Not
                 vpos
               )
           if (!resolvedDefs) return resolvedDefs
-          if (service.isLocationLinkArray(resolvedDefs)) {
-            return resolvedDefs.map(loc => service.mapLocationToCell(query.state, loc)) as vscode.LocationLink[]
-          }
-          return resolvedDefs.map(loc => service.mapLocationToCell(query.state, loc)) as vscode.Location[]
+          return toLocationLinks(doc, pos, resolvedDefs, loc => service.mapLocationToCell(query.state, loc))
         }
       }
     )
