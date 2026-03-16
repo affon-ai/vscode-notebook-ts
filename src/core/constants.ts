@@ -1,0 +1,12 @@
+export const SCHEME = 'notebook-ts'
+export const DIAG_COLLECTION = 'notebook-ts'
+export const CONFIG_SECTION = 'notebookTs'
+export const CONFIG_TYPE_ROOTS = 'typeRoots'
+export const CONFIG_TSCONFIG = 'tsconfigPath'
+export const VIRTUAL_DIR = '.notebook-ts'
+export const NOTEBOOK_TS_LANGUAGE = 'typescript-notebook'
+export const TS_LANGUAGE = 'typescript'
+export const JS_LANGUAGE = 'javascript'
+export const UPDATE_DEBOUNCE_MS = 200
+export const BACKGROUND_FLUSH_MS = 500
+export const SUPPRESSED_DUPLICATE_DECLARATION_CODES = new Set([2300, 2451])
